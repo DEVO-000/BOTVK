@@ -1,0 +1,5 @@
+aiohttp>=3.9
+groq>=0.11
+pymongo>=4.6
+qrcode[pil]>=7.4
+Pillow>=10.0
