@@ -9,6 +9,12 @@ main.py переносится практически без изменений.
 
 Реализовано:
   * Long Poll сервера VK (groups.getLongPollServer + цикл a_check, version=3);
+  * Работа и в личных сообщениях, и в ГРУППОВЫХ БЕСЕДАХ VK (peer_id > 2000000000):
+      - персональные данные/балансы хранятся за from_id (пользователь),
+        ответы отправляются в peer_id (текущий чат);
+      - автоматическая очистка упоминаний бота «[clubXXXX|@name]» из текста
+        команд (ТЗ DEVORKS+ п.0);
+      - ConversationHandler ведёт отдельный контекст на пару (chat_id, user_id);
   * Тротлинг вызовов VK API (защита от ошибки 6 «too many requests»);
   * Отправка/редактирование/удаление сообщений, отправка фотографий (QR-коды);
   * Инлайн- и обычные клавиатуры с учётом официальных лимитов VK:
@@ -441,16 +447,22 @@ class User:
 
 
 class Chat:
-    """Аналог telegram.Chat — приватный диалог с сообществом."""
+    """Аналог telegram.Chat — диалог с сообществом (ЛС) или беседа VK."""
 
-    def __init__(self, id):
+    def __init__(self, id, chat_type="private"):
         self.id = int(id)
-        self.type = "private"
+        # «private» — личка с сообществом, «group» — беседа (peer_id > 2000000000).
+        self.type = "group" if int(id) > 2000000000 else (chat_type or "private")
         self.first_name = ""
         self.last_name = ""
 
+    @property
+    def is_group(self):
+        """True, если чат — групповая беседа VK (peer_id > 2000000000)."""
+        return self.type == "group"
+
     def __repr__(self):
-        return f"<Chat {self.id}>"
+        return f"<Chat {self.id} {self.type}>"
 
 
 class PhotoSize:
@@ -500,6 +512,29 @@ class File:
         data = await self._bot._download_bytes(self.file_id)
         out.write(data)
         return out
+
+
+def _strip_vk_mention(text: str) -> str:
+    """Убирает системные упоминания бота/пользователей из текста сообщения.
+
+    В беседах ВК команда часто приходит с префиксом-упоминанием вида
+    «[club123456|@devorks] /start» или «[club123456|DEVORKS+] 📅 Сегодня».
+    Без очистки такие команды не распознаются хендлерами. Убираем только
+    упоминания в НАЧАЛЕ текста (чтобы не трогать упоминания внутри текста
+    обычных сообщений) + возможные запятые/пробелы между ними.
+    """
+    if not text:
+        return text or ""
+    pattern = re.compile(
+        r"^(?:\s|,)*\[(?:club|public|event|id)\d+\|[^\]]*\](?:\s|,)*"
+    )
+    prev = None
+    t = text
+    # Упоминаний может быть несколько подряд — чистим в цикле.
+    while prev != t:
+        prev = t
+        t = pattern.sub("", t)
+    return t.strip()
 
 
 class Message:
@@ -670,6 +705,9 @@ class Update:
         else:
             self.effective_user = None
             self.effective_chat = None
+        # Контекст беседы: для групповых чатов это peer_id беседы,
+        # для личных — id пользователя (как и раньше).
+        self.effective_chat_id = self.effective_chat.id if self.effective_chat else None
 
     @property
     def effective_message_id(self):
@@ -930,7 +968,10 @@ class ConversationHandler(BaseHandler):
     """Упрощённый аналог telegram.ext.ConversationHandler.
 
     Поддерживает entry_points / states / fallbacks / allow_reentry —
-    как в оригинальном боте. Ключ разговора — chat_id (приватный диалог).
+    как в оригинальном боте. Ключ разговора — пара (chat_id, user_id):
+    в личных сообщениях chat_id == user_id (поведение как раньше),
+    а в групповых беседах у КАЖДОГО участника свой независимый
+    контекст диалога с ботом.
     """
 
     END = -1
@@ -945,13 +986,24 @@ class ConversationHandler(BaseHandler):
         self.states = states or {}
         self.fallbacks = fallbacks or []
         self.allow_reentry = allow_reentry
-        self._conversations = {}  # chat_id -> state
+        self._conversations = {}  # (chat_id, user_id) -> state
+
+    @staticmethod
+    def _key_for(update):
+        """Ключ разговора: (chat_id, user_id). В ЛС user_id == chat_id."""
+        chat = update.effective_chat
+        user = update.effective_user
+        chat_id = int(chat.id) if chat else 0
+        user_id = int(user.id) if user else 0
+        if not user_id:
+            user_id = chat_id
+        return (chat_id, user_id)
 
     def check_update(self, update) -> bool:
         chat = update.effective_chat
         if chat is None:
             return False
-        key = chat.id
+        key = self._key_for(update)
         active = key in self._conversations
         if not active and not self._matches_any(update):
             return False
@@ -967,8 +1019,7 @@ class ConversationHandler(BaseHandler):
         return False
 
     async def handle_update(self, update, context):
-        chat = update.effective_chat
-        key = chat.id
+        key = self._key_for(update)
         new_state = None
         handled = False
 
@@ -1016,8 +1067,12 @@ class ConversationHandler(BaseHandler):
             self._conversations[key] = new_state
         return new_state
 
-    def get_state(self, chat_id):
-        return self._conversations.get(chat_id)
+    def get_state(self, chat_id, user_id=None):
+        """Состояние разговора. Для обратной совместимости допускает вызов
+        get_state(chat_id) — в ЛС ключ (chat_id, chat_id)."""
+        if user_id is None:
+            return self._conversations.get((int(chat_id), int(chat_id)))
+        return self._conversations.get((int(chat_id), int(user_id)))
 
 
 # ============================================================================
@@ -1177,10 +1232,11 @@ class CallbackContext:
         if update is not None:
             if update.effective_user is not None:
                 self._user_id = int(update.effective_user.id)
-            if update.message is not None:
+            # chat_data привязан к чату (в беседе — к беседе, в ЛС — к юзеру).
+            if update.effective_chat is not None:
                 self.chat_data = application.chat_data.setdefault(
                     update.effective_chat.id, {}
-                ) if update.effective_chat else {}
+                )
             else:
                 self.chat_data = {}
         else:
@@ -1857,24 +1913,32 @@ class Application:
 
     # -------------------------------------------------- конструирование Update
     async def _mk_update_message(self, msg_raw):
-        """message_new → Update(Update.message)."""
+        """message_new → Update(Update.message).
+
+        Поддерживаются и личные сообщения, и групповые беседы VK:
+          * peer_id — чат, в который бот отвечает (в ЛС == from_id,
+            в беседе — 2000000000 + chat_id);
+          * from_id — пользователь, от которого пришло сообщение. Все
+            персональные данные (профиль, настройки, баланс штук)
+            сохраняются именно за from_id;
+          * из текста убирается системное упоминание бота вида
+            «[clubXXXXX|@group_name]», чтобы команды вида
+            «[club123|@devorks] /start» распознавались корректно.
+        """
         try:
             peer_id = int(msg_raw.get("peer_id", 0))
             from_id = int(msg_raw.get("from_id", 0))
             # Игнорируем собственные исходящие события.
             if msg_raw.get("out"):
                 return None
-            # В групповых беседах peer_id != from_id — бот рассчитан на личку.
-            if peer_id != from_id and peer_id > 2000000000:
-                # Беседа: вежливо отказываем один раз.
-                try:
-                    await self.bot.send_message(
-                        peer_id,
-                        "👋 Бот работает только в личных сообщениях. "
-                        "Напишите мне в личку!",
-                    )
-                except Exception:
-                    pass
+            # Сервисные сообщения бесед («N присоединился к беседе» и т. п.)
+            # не содержат полезного текста — пропускаем.
+            if msg_raw.get("action"):
+                return None
+            # Сообщения от сообществ/ботов (from_id < 0) пропускаем:
+            # во-первых, персональные данные за ними не закреплены,
+            # во-вторых, это защита от зацикливания «бот ↔ бот».
+            if from_id < 0:
                 return None
             user = None
             if from_id > 0:
@@ -1882,6 +1946,9 @@ class Application:
             else:
                 user = await self.bot.get_me()
             text = msg_raw.get("text") or ""
+            # В беседах команда часто приходит с упоминанием бота:
+            # «[club123456|@devorks] /start» — очищаем префикс.
+            text = _strip_vk_mention(text)
             # VK deep-link: если пользователь перешёл по ссылке вида
             # https://vk.com/write-<group>?ref=<code>, то В ПЕРВОМ сообщении
             # приходит поле ref. Конвертируем его в «/start <ref>» — так же,

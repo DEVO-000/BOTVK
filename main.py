@@ -39,7 +39,7 @@ from aiohttp import web
 # Минимально нужны:
 #   VK_TOKEN       — ключ доступа сообщества (Управление → Работа с API → Ключи)
 #   VK_GROUP_ID    — числовой id вашей группы ВК (со знаком минус НЕ нужен)
-#   GROQ_API_KEY   — ключ Groq API для DEVO+ai
+#   GROQ_API_KEY   — ключ Groq API для DEVORKS+AI
 #   DEVELOPER_ID   — VK user_id владельца/разработчика
 # Опционально:
 #   GROQ_MODEL     — модель Groq (по умолчанию llama-3.3-70b-versatile)
@@ -319,6 +319,14 @@ DEV_PAYMENT_RECEIPT = 120
 DEV_SELFEMP_INPUT = 121
 # Изменение цены существующей платной кнопки.
 DEV_PAID_BUTTON_PRICE_CHANGE = 122
+# === ТЗ DEVORKS+: новые состояния ===
+# Ввод времени ОКОНЧАНИЯ звонка (второй шаг после EDIT_BELL_TIME —
+# раньше оба шага висели на одном состоянии и бот зацикливался).
+EDIT_BELL_END = 123
+# Переименование существующей платной кнопки (панель разработчика).
+DEV_PAID_BUTTON_RENAME = 124
+# Изменение контента существующей платной кнопки (панель разработчика).
+DEV_PAID_BUTTON_EDIT_CONTENT = 125
 
 # Глобальное хранилище для временных данных оплаты (контекст покупок).
 # В новой платёжной схеме (самозанятость) основное состояние платежей
@@ -856,6 +864,50 @@ async def reject_if_forbidden_chars(update, text, return_state):
     return return_state
 
 
+def _normalize_user_url(text):
+    """ТЗ DEVORKS+ п.3: бережная нормализация пользовательской ссылки.
+
+    ИСПРАВЛЕНО: раньше «правка содержимого» кнопки-ссылки прогонялась через
+    проверку запрещённых символов — а любой корректный URL содержит «/»
+    (например, https://vk.com/page), поэтому бот ОТКАЗЫВАЛСЯ принимать
+    верные ссылки («недопустимые символы»).
+
+    Теперь URL обрабатывается отдельно от обычного текста:
+      * протокол можно не указывать (vk.com/page → https://vk.com/page);
+      * допускаются http/https (ftp и прочее — нет);
+      * пробелы и кириллица в домене — отклоняются с понятной ошибкой.
+
+    Возвращает (ok, url, error_message).
+    """
+    from urllib.parse import urlparse
+
+    raw = (text or "").strip()
+    if not raw:
+        return False, "", "Ссылка не может быть пустой. Введите URL:"
+    # Убираем случайные пробелы внутри (VK иногда «склеивает» переносы).
+    if "\n" in raw or "\t" in raw:
+        raw = " ".join(raw.split())
+    if " " in raw:
+        return False, "", (
+            "В ссылке не должно быть пробелов. Отправьте ссылку одним "
+            "сообщением, например: https://vk.com/page"
+        )
+    candidate = raw
+    if not candidate.startswith(("http://", "https://")):
+        candidate = "https://" + candidate
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return False, "", "Не удалось разобрать ссылку. Попробуйте ещё раз:"
+    host = (parsed.hostname or "").lower()
+    if not host or "." not in host:
+        return False, "", (
+            "Похоже, это не ссылка. Отправьте адрес вида "
+            "vk.com/page или https://vk.com/page"
+        )
+    return True, candidate, ""
+
+
 # --- Очистка ранее сохранённых данных от запрещённых символов ---
 # Запускается один раз при старте бота, чтобы старые расписания/ДЗ/тексты
 # (которые могли содержать `/`, `*` и т.п.) перестали ронять отображение
@@ -1242,6 +1294,40 @@ def toggle_dev_new_user_notifications():
 
 PRICES = load_prices()
 
+# ТЗ DEVORKS+ п.2 «Моментальная синхронизация цен»: изменения из панели
+# разработчика применяются мгновенно (глобальный PRICES мутируется и
+# сохраняется). Этот хук дополнительно подтягивает правки prices.json,
+# сделанные ВНЕ бота (руками по SSH/в редакторе), без перезапуска:
+# единый тикер каждые 30 секунд проверяет mtime файла и перечитывает его.
+_prices_file_mtime = [None]
+
+
+def _maybe_refresh_prices():
+    """Перечитывает prices.json при внешнем изменении (без рестарта бота)."""
+    try:
+        if _supabase_ready or _mongo_kv is not None:
+            # Облачное хранилище: prices.json пишет только сам бот через
+            # панель — внешних правок файла нет, синхронизация не нужна.
+            return
+        if not os.path.exists(PRICES_FILE):
+            return
+        mtime = os.path.getmtime(PRICES_FILE)
+        if _prices_file_mtime[0] is None:
+            _prices_file_mtime[0] = mtime
+            return
+        if mtime != _prices_file_mtime[0]:
+            _prices_file_mtime[0] = mtime
+            fresh = load_prices()
+            if isinstance(fresh, dict):
+                PRICES.clear()
+                PRICES.update(fresh)
+                logger.info(
+                    "prices.json изменён извне — цены перечитаны "
+                    "без перезапуска бота."
+                )
+    except Exception as e:
+        logger.error(f"_maybe_refresh_prices: {e}")
+
 # ==================================
 # === АНОНИМКИ: ХРАНЕНИЕ / АВТО-ОЧИСТКА ===
 # ==================================
@@ -1388,6 +1474,12 @@ class User:
         # эмодзи-префикс, потому что Bot API не позволяет красить нативный
         # фон кнопок. Тоггл доступен в ⚙️ Настройки → «Цветные кнопки».
         self.colored_buttons_enabled = True
+        # === Сетка кнопок (ТЗ п.1) ===
+        # Сколько кнопок в ряду у главного меню пользователя: 2 (по умолчанию),
+        # 3 или 4. None — настройка ещё не задана, используется старый
+        # button_layout ('default' = 2 в ряду). Меняется в
+        # ⚙️ Настройки → 📱 Сетка кнопок.
+        self.keyboard_rows = None
         # === Чат поддержки ===
         # Сообщения поддержки от/к разработчику не хранятся в User напрямую —
         # они уходят непосредственно в чат разработчика. Здесь храним только
@@ -1469,6 +1561,8 @@ class User:
             'last_action_ts': getattr(self, 'last_action_ts', 0.0),
             # Платные кнопки: купленные навсегда (ТЗ п.1)
             'purchased_buttons': getattr(self, 'purchased_buttons', []),
+            # Сетка кнопок: 2/3/4 кнопки в ряду (ТЗ п.1)
+            'keyboard_rows': getattr(self, 'keyboard_rows', None),
             # Авто-очистка анонимок
             'anon_purge_notify': getattr(self, 'anon_purge_notify', True),
             'anon_keep_until': getattr(self, 'anon_keep_until', None),
@@ -1531,6 +1625,9 @@ class User:
             user.anon_keep_until = None
         if not hasattr(user, 'purchased_buttons') or user.purchased_buttons is None:
             user.purchased_buttons = []
+        # Сетка кнопок: валидируем значение (2 / 3 / 4), иначе — «не задано».
+        if not hasattr(user, 'keyboard_rows') or user.keyboard_rows not in (2, 3, 4):
+            user.keyboard_rows = None
         return user
 
 
@@ -2096,7 +2193,7 @@ INSTRUCTIONS_VERSION = "3.0-vk"
 
 def _default_instructions_text():
     return (
-        '📚 **ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ БОТА DEVO+WORKS (VK)**\n\n'
+        '📚 **ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ БОТА DEVORKS+ (VK)**\n\n'
         '**📋 ОСНОВНЫЕ ФУНКЦИИ:**\n'
         '1. **Регистрация** — укажите дату рождения и местное время (нужно для часового пояса и поздравлений).\n'
         '2. **Классы** — создайте класс или войдите по коду. В одном классе до 40 человек и до 2 доп. админов.\n'
@@ -2107,7 +2204,7 @@ def _default_instructions_text():
         '6. **Утренние и вечерние уведомления** — настройте удобное время и свой текст для «доброе утро» и «спокойной ночи».\n'
         '7. **День рождения** — бот сам поздравит вас в этот день и (по желанию) напомнит классу.\n'
         '8. **Погода и праздники** — ежедневный прогноз по вашему городу и напоминания о праздниках.\n'
-        '9. **DEVO+ai** — умный помощник: задайте любой вопрос и получите ответ (можно присылать и фото).\n'
+        '9. **DEVORKS+AI** — умный помощник: задайте любой вопрос и получите ответ (можно присылать и фото).\n'
         '10. **Анонимные сообщения** — отправляйте одноклассникам анонимные сообщения и отвечайте на них.\n'
         '11. **Личные и классные кнопки** — создавайте свои кнопки (ссылки/текст) и делайте меню удобным.\n\n'
         '**⚙️ НАСТРОЙКИ КНОПОК:**\n'
@@ -3096,13 +3193,20 @@ ALL_MAIN_MENU_BUTTONS = [
     "🎓 Управление классами",
     "🌟 Мои кнопки",
     "🪙 Штуки",
-    "🤖 DEVO+ai",
+    "🤖 DEVORKS+AI",
     "🌦 Погода",
     "📚 Инструкция",
     "🔑 Код класса",
     "🚪 Выйти из класса",
     "🔓 Выйти из аккаунта"
 ]
+
+# Старые имена кнопок до переименования бота в DEVORKS+. Используются,
+# чтобы настройки видимости/переименования, сохранённые пользователями
+# до переименования, продолжали действовать (старое имя → новое).
+LEGACY_BUTTON_ALIASES = {
+    "🤖 DEVO+ai": "🤖 DEVORKS+AI",
+}
 
 
 def _safe_cb(prefix, name, max_bytes=64):
@@ -3171,9 +3275,17 @@ def _apply_user_button_settings(user, raw_button_names):
     """ПУНКТ 4: применяет к списку имён кнопок настройки пользователя:
     - удаляет скрытые
     - переименовывает по карте user.custom_buttons {старое: новое}
-    Возвращает список отображаемых имён (в том же порядке)."""
+    Возвращает список отображаемых имён (в том же порядке).
+
+    LEGACY: если пользователь скрыл кнопку под СТАРЫМ именем (до
+    переименования в DEVORKS+), скрываем её и под новым именем.
+    """
     hidden = getattr(user, 'hidden_buttons', []) or []
-    rename_map = getattr(user, 'custom_buttons', {}) or {}
+    # Расширяем список скрытых имён их новыми эквивалентами.
+    hidden = list(hidden) + [
+        LEGACY_BUTTON_ALIASES[h] for h in hidden if h in LEGACY_BUTTON_ALIASES
+    ]
+    rename_map = dict(getattr(user, 'custom_buttons', {}) or {})
     out = []
     for name in raw_button_names:
         if name in hidden:
@@ -3182,24 +3294,87 @@ def _apply_user_button_settings(user, raw_button_names):
     return out
 
 
-def _layout_chunk(items, layout):
-    """Раскладывает список кнопок на ряды согласно layout."""
+def _user_kb_per_row(user, layout='default'):
+    """Сколько кнопок в ряду показывать пользователю (ТЗ п.1 «Сетка кнопок»).
+
+    Приоритет:
+      1. user.keyboard_rows — новая настройка (2 / 3 / 4 кнопки в ряду);
+      2. старый button_layout: 'compact' = 3 в ряду, 'wide' = 1 в ряду,
+         остальное (default) = 2 в ряду.
+    """
+    kb_rows = getattr(user, 'keyboard_rows', None)
+    if kb_rows in (2, 3, 4):
+        return int(kb_rows)
     if layout == 'compact':
-        per_row = 3
+        return 3
     elif layout == 'wide':
-        per_row = 1
+        return 1
+    return 2
+
+
+def _layout_chunk(items, layout, per_row=None):
+    """Раскладывает список кнопок на ряды согласно layout.
+
+    per_row — явное число кнопок в ряду (ТЗ «Сетка кнопок»: 2/3/4);
+    имеет приоритет над layout, чтобы настройка пользователя
+    применялась к любой Reply-клавиатуре.
+    """
+    if per_row is not None:
+        n = int(per_row)
+    elif layout == 'compact':
+        n = 3
+    elif layout == 'wide':
+        n = 1
     else:
-        per_row = 2
+        n = 2
+    n = max(1, min(n, 5))  # лимит VK — не более 5 кнопок в ряду
     rows = []
-    for i in range(0, len(items), per_row):
-        rows.append(items[i:i + per_row])
+    for i in range(0, len(items), n):
+        rows.append(items[i:i + n])
     return rows
+
+
+def _is_group_update(update) -> bool:
+    """True, если апдейт пришёл из групповой беседы VK (ТЗ п.0).
+
+    В беседе peer_id > 2000000000: там бот отвечает в текущий чат,
+    а персональные данные (профиль/баланс) ведёт по from_id."""
+    try:
+        chat = getattr(update, 'effective_chat', None)
+        return bool(chat and int(chat.id) > 2000000000)
+    except Exception:
+        return False
+
+
+def _chat_reply_target(update, user=None):
+    """Куда отправлять сообщения/клавиатуры для этого апдейта (ТЗ п.0).
+
+    В беседе — peer_id текущего чата (чтобы ответ видел весь чат),
+    в личных сообщениях — id пользователя."""
+    try:
+        chat = getattr(update, 'effective_chat', None)
+        if chat is not None and int(chat.id) > 2000000000:
+            return int(chat.id)
+    except Exception:
+        pass
+    uid = getattr(user, 'user_id', None)
+    if uid is None:
+        u = getattr(update, 'effective_user', None)
+        uid = u.id if u else 0
+    try:
+        return int(uid)
+    except Exception:
+        return 0
 
 
 def get_main_menu_keyboard(user):
     """ПУНКТ 4: учитывает hidden_buttons, custom_buttons (переименование),
     button_layout (расположение) и custom_button_order (порядок) для ВСЕХ кнопок,
-    включая личные/глобальные/классные."""
+    включая личные/глобальные/классные.
+
+    ТЗ п.1 «Сетка кнопок»: число кнопок в ряду берётся из
+    user.keyboard_rows (2 — по умолчанию, 3 или 4) и применяется
+    ко всем рядам главного меню."""
     class_obj = get_class_by_user(user.user_id)
     is_blocked_in_class = class_obj and is_user_class_blocked(user.user_id, class_obj.class_code)
     is_admin = class_obj and str(user.user_id) in class_obj.admins and not is_blocked_in_class
@@ -3208,6 +3383,8 @@ def get_main_menu_keyboard(user):
     rename_map = getattr(user, 'custom_buttons', {}) or {}
     layout = getattr(user, 'button_layout', 'default') or 'default'
     custom_order = getattr(user, 'custom_button_order', []) or []
+    # ТЗ п.1: сколько кнопок в ряду (2/3/4) — сетка пользователя.
+    per_row = _user_kb_per_row(user, layout)
 
     # Собираем все стандартные кнопки в один плоский список.
     # Кнопка «📅 Расписание» открывает экран выбора дня недели и показывает
@@ -3223,7 +3400,7 @@ def get_main_menu_keyboard(user):
         "⏰ Таймер", "🕵️ Анонимное сообщение",
         "🎓 Управление классами",
         "⚙️ Настройки", "🌟 Мои кнопки",
-        "🪙 Штуки", "🤖 DEVO+ai",
+        "🪙 Штуки", "🤖 DEVORKS+AI",
         "🌦 Погода",
         # ПУНКТ 3: чат поддержки прямо из главного меню (всегда доступен).
         "💬 Чат поддержки",
@@ -3252,7 +3429,7 @@ def get_main_menu_keyboard(user):
     personal_buttons = get_personal_buttons(user.user_id)
     personal_names = [b.name for b in personal_buttons]
     personal_visible = _apply_user_button_settings(user, personal_names)
-    for row in _layout_chunk(personal_visible, layout):
+    for row in _layout_chunk(personal_visible, layout, per_row=per_row):
         keyboard.append(row)
 
     # Глобальные кнопки — учитывают hide/rename. Платные (price>0) помечаются
@@ -3271,7 +3448,7 @@ def get_main_menu_keyboard(user):
         else:
             global_names.append(b.name)
     global_visible = _apply_user_button_settings(user, global_names)
-    for row in _layout_chunk(global_visible, layout):
+    for row in _layout_chunk(global_visible, layout, per_row=per_row):
         keyboard.append(row)
 
     # Кнопки класса — учитывают hide/rename
@@ -3284,20 +3461,20 @@ def get_main_menu_keyboard(user):
             elif button.creator_id == user.user_id:
                 class_names.append(button.name)
         class_visible = _apply_user_button_settings(user, class_names)
-        for row in _layout_chunk(class_visible, layout):
+        for row in _layout_chunk(class_visible, layout, per_row=per_row):
             keyboard.append(row)
 
     if is_admin:
         # Админские быстрые действия (тоже фильтруем по скрытым)
         admin_extra = ["➕ Добавить ДЗ", "🗑️ Удалить ДЗ"]
         admin_visible = _apply_user_button_settings(user, admin_extra)
-        for row in _layout_chunk(admin_visible, layout):
+        for row in _layout_chunk(admin_visible, layout, per_row=per_row):
             keyboard.append(row)
         if "📢 Написать классу" not in hidden_buttons:
             keyboard.append([rename_map.get("📢 Написать классу", "📢 Написать классу")])
 
-    # Стандартные кнопки — раскладываем по layout
-    for row in _layout_chunk(standard_visible, layout):
+    # Стандартные кнопки — раскладываем по сетке пользователя (2/3/4 в ряду)
+    for row in _layout_chunk(standard_visible, layout, per_row=per_row):
         keyboard.append(row)
 
     # ПУНКТ 9: «📨 Мои анонимные сообщения» — отдельным рядом во всю ширину,
@@ -3326,6 +3503,66 @@ def get_user_button_reverse_map(user):
     ПУНКТ 4: чтобы handle_main_menu корректно ловил переименованные кнопки."""
     rename_map = getattr(user, 'custom_buttons', {}) or {}
     return {v: k for k, v in rename_map.items()}
+
+
+def _known_menu_labels(user):
+    """ТЗ п.0 «Работа в беседах»: все подписи кнопок, на которые бот
+    может реагировать в групповом чате.
+
+    В беседе бот отвечает только на команды (их ловит CommandHandler)
+    и на клики по кнопкам своего меню. Этот набор имён позволяет
+    отличить «клик по кнопке» от обычного сообщения в чате.
+    """
+    labels = set()
+    # Стандартные кнопки главного меню + служебные.
+    labels.update(ALL_MAIN_MENU_BUTTONS)
+    labels.update({
+        "⚙️ Настройки", "💬 Чат поддержки", "⬅️ Назад в меню",
+        "❌ Выход из ai", "📢 Написать классу",
+        "➕ Добавить ДЗ", "🗑️ Удалить ДЗ",
+        "📨 Мои анонимные сообщения", "👨‍💼 Админская панель",
+        "🛠️ Панель разработчика", "🚪 Выйти из класса",
+        "🔓 Выйти из аккаунта",
+    })
+    # Переименованные варианты стандартных кнопок (пользователь мог
+    # переименовать — тогда в чат уходит уже новое имя).
+    try:
+        labels.update(_apply_user_button_settings(user, list(labels)))
+    except Exception:
+        pass
+    # Личные кнопки пользователя.
+    try:
+        for b in get_personal_buttons(user.user_id):
+            labels.add(b.name)
+    except Exception:
+        pass
+    # Глобальные кнопки, включая отображаемые имена платных (🔒 … (N шт) / ✅ …).
+    try:
+        purchased = [str(x) for x in (getattr(user, 'purchased_buttons', []) or [])]
+        for b in get_global_buttons():
+            labels.add(b.name)
+            price = int(getattr(b, 'price', 0) or 0)
+            if price > 0:
+                if str(b.button_id) in purchased:
+                    labels.add(f"✅ {b.name}")
+                else:
+                    labels.add(_paid_display_name(b))
+    except Exception:
+        pass
+    # Кнопки класса.
+    try:
+        class_obj = get_class_by_user(user.user_id)
+        if class_obj:
+            for b in get_class_custom_buttons(class_obj.class_code):
+                if b.name.startswith("CLASS_"):
+                    labels.add(b.name.replace("CLASS_", ""))
+                elif b.creator_id == user.user_id:
+                    labels.add(b.name)
+    except Exception:
+        pass
+    # Легаси-имена (клавиатуры, оставшиеся у пользователей до переименования).
+    labels.update(LEGACY_BUTTON_ALIASES.keys())
+    return labels
 
 def get_quick_admin_keyboard():
     return ReplyKeyboardMarkup([
@@ -3551,10 +3788,14 @@ def get_anon_buy_space_keyboard():
 
 def get_settings_keyboard(user=None):
     """Главная клавиатура настроек."""
+    # ТЗ п.1: текущая сетка кнопок (2/3/4 в ряду) для подписи.
+    kb_rows = getattr(user, 'keyboard_rows', None) if user else None
+    kb_rows = kb_rows if kb_rows in (2, 3, 4) else 2
     keyboard = [
         [InlineKeyboardButton("⏰ Изменить время", callback_data="change_time")],
         [InlineKeyboardButton("✏️ Изменить названия кнопок", callback_data="change_buttons")],
         [InlineKeyboardButton("🔄 Изменить расположение", callback_data="change_layout")],
+        [InlineKeyboardButton(f"📱 Сетка кнопок: {kb_rows} в ряду", callback_data="kb_grid")],
         [InlineKeyboardButton("🔄 Переместить кнопки", callback_data="move_buttons")],
         [InlineKeyboardButton("👁 Скрыть/показать кнопки", callback_data="manage_visibility")],
         [InlineKeyboardButton("🔑 Код класса", callback_data="show_class_code")],
@@ -3759,7 +4000,7 @@ def get_anonymous_reply_keyboard(message_id):
 # ==================================
 
 async def _ai_thinking_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
-    """ПУНКТ 4: фоновая анимация «DEVO+ai думает…» — крутит фазы, пока не отменят.
+    """ПУНКТ 4: фоновая анимация «DEVORKS+AI думает…» — крутит фазы, пока не отменят.
 
     Не должен валить основной хендлер, поэтому все исключения глотаем.
     Цикл прерывается через asyncio.CancelledError из основной корутины.
@@ -3792,7 +4033,7 @@ async def _ai_thinking_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                 # непарных подчёркиваниях/звёздочках в любом из
                 # фреймов, и анимация работает на любых клиентах.
                 frame_text = (
-                    f"{pulse[i % len(pulse)]} DEVO+ai "
+                    f"{pulse[i % len(pulse)]} DEVORKS+AI "
                     f"{spinner[i % len(spinner)]}\n\n"
                     f"{captions[i % len(captions)]}{dots[i % len(dots)]}"
                 )
@@ -3818,7 +4059,7 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     чтобы бот не «замолкал» после нескольких сообщений.
 
     ПУНКТ 4: пока модель отвечает, пользователю показывается анимированное
-    сообщение «DEVO+ai думает…», которое затем заменяется на реальный ответ.
+    сообщение «DEVORKS+AI думает…», которое затем заменяется на реальный ответ.
 
     НОВОЕ: поддержка фото (Groq Vision). Если в сообщении есть фото —
     оно скачивается, кодируется в base64 и отправляется в вижн-модель
@@ -3842,7 +4083,7 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking_msg = None
     anim_task = None
     try:
-        thinking_msg = await update.message.reply_text("🤖 DEVO+ai думает   ⏳")
+        thinking_msg = await update.message.reply_text("🤖 DEVORKS+AI думает   ⏳")
         anim_task = asyncio.create_task(
             _ai_thinking_animation(context, chat_id, thinking_msg.message_id)
         )
@@ -3933,7 +4174,7 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_conversations[user_id] and user_conversations[user_id][-1].get("role") == "user":
             user_conversations[user_id].pop()
         try:
-            err_text = "⏱ DEVO+ai не ответил вовремя. Попробуйте ещё раз — я всё ещё здесь."
+            err_text = "⏱ DEVORKS+AI не ответил вовремя. Попробуйте ещё раз — я всё ещё здесь."
             if thinking_msg:
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=thinking_msg.message_id, text=err_text
@@ -3969,7 +4210,7 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _stop_animation()
 
     # Отправляем ответ БЕЗ Markdown, чтобы не падать на не-парных *, _, ` и т.п.
-    prefix = "🤖 DEVO+ai:\n\n"
+    prefix = "🤖 DEVORKS+AI:\n\n"
     full_text = prefix + ai_response if ai_response else prefix + "(пустой ответ)"
     try:
         # Telegram лимит — 4096 символов на сообщение
@@ -4477,7 +4718,7 @@ async def send_blocked_message(update, context, user_id):
 async def show_disclaimer(update, context):
     disclaimer_text = (
         "⚠️ **ВАЖНОЕ УВЕДОМЛЕНИЕ**\n\n"
-        "Перед использованием бота DEVO+WORKS, пожалуйста, подтвердите:\n\n"
+        "Перед использованием бота DEVORKS+, пожалуйста, подтвердите:\n\n"
         "1. ✅ Я прочитал(а) инструкцию по использованию бота\n"
         "2. ✅ Я понимаю и принимаю, что разработчик не несет ответственности за:\n"
         "   • Содержание сообщений, создаваемых пользователями\n"
@@ -4576,7 +4817,7 @@ async def instructions_read_handler(update: Update, context: ContextTypes.DEFAUL
     # Дальше — регистрация как раньше
     if not user.birthday:
         await query.edit_message_text(
-            "👋 Добро пожаловать в DEVO+WORKS! Давайте настроим ваш профиль.\n\n"
+            "👋 Добро пожаловать в DEVORKS+! Давайте настроим ваш профиль.\n\n"
             "🎂 Введите вашу реальную дату рождения в формате ГГГГ-ММ-ДД (например, 2005-04-15):\n\n"
             "Бот будет напоминать вам о дне рождения и может поздравить вас в классе!"
         )
@@ -4693,7 +4934,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     except Exception as e:
         logger.error(f"show_main_menu: ошибка обработки реферального бонуса: {e}")
 
-    greeting_text = f"👋 Добро пожаловать в DEVO+WORKS, {user.first_name}!"
+    greeting_text = f"👋 Добро пожаловать в DEVORKS+, {user.first_name}!"
     keyboard = get_main_menu_keyboard(user)
 
     if hasattr(update, 'message') and update.message:
@@ -4703,14 +4944,16 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             await update.callback_query.edit_message_text("✅ Возвращаюсь в главное меню...")
         except Exception:
             pass
+        # ТЗ п.0: в беседе главное меню отправляем в текущий чат (peer_id),
+        # в личке — пользователю.
         await context.bot.send_message(
-            chat_id=update.callback_query.from_user.id,
+            chat_id=_chat_reply_target(update, user),
             text=greeting_text,
             reply_markup=keyboard
         )
     else:
         await context.bot.send_message(
-            chat_id=user.user_id,
+            chat_id=_chat_reply_target(update, user),
             text=greeting_text,
             reply_markup=keyboard
         )
@@ -4828,9 +5071,16 @@ async def back_to_settings_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def auto_reenter_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Автоматический повторный вход в главное меню, если ConversationHandler
-    завершился (по таймауту или ошибке). Не требует /start."""
+    завершился (по таймауту или ошибке). Не требует /start.
+
+    ТЗ п.0: в групповых беседах молчим — «возврат в меню» на каждое
+    случайное сообщение спамил бы весь чат. Пользователь в беседе
+    возвращается в меню командой /start или кнопкой меню."""
     # Не пытаемся обрабатывать callback-и здесь — они идут через handle_callback
     if not getattr(update, "message", None):
+        return MAIN_MENU
+    # В беседе обычный текст игнорируем (не спамим чат).
+    if _is_group_update(update):
         return MAIN_MENU
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
@@ -4864,6 +5114,9 @@ async def handle_main_menu_photo(update: Update, context: ContextTypes.DEFAULT_T
     В режиме AI (`ai_mode == True`) фото уходит в Groq Vision через
     `handle_ai_message`. В обычном режиме отвечаем подсказкой, чтобы
     пользователь сначала зашёл в AI-режим.
+
+    В ГРУППОВЫХ БЕСАДАХ (ТЗ п.0) фото без включённого AI-режима
+    игнорируем молча — иначе бот комментировал бы каждое фото чата.
     """
     user_id = str(update.effective_user.id)
     if not await ensure_subscribed(update, context):
@@ -4876,6 +5129,10 @@ async def handle_main_menu_photo(update: Update, context: ContextTypes.DEFAULT_T
 
     if context.user_data.get('ai_mode'):
         await handle_ai_message(update, context)
+        return MAIN_MENU
+
+    # ТЗ п.0: в беседе реагируем на фото только в режиме AI.
+    if _is_group_update(update):
         return MAIN_MENU
 
     await update.message.reply_text(
@@ -4913,6 +5170,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('replying_to_anon'):
         return await send_anonymous_reply(update, context)
+
+    # ТЗ п.0 «Работа в беседах»: в групповом чате бот реагирует ТОЛЬКО на
+    # клики по кнопкам своего меню (и команды, которые ловит CommandHandler).
+    # Обычные сообщения беседы игнорируем молча, чтобы не спамить чат.
+    # Исключение — включённый режим AI (пользователь сам его активировал).
+    if _is_group_update(update) and not context.user_data.get('ai_mode'):
+        if message_text not in _known_menu_labels(user):
+            return MAIN_MENU
 
     if context.user_data.get('ai_mode'):
         # Любой вариант «выход» — гарантированно выходим из режима AI
@@ -5111,11 +5376,14 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return SUPPORT_CHAT_MESSAGE
 
-    elif message_text == "🤖 DEVO+ai":
+    elif message_text == "🤖 DEVORKS+AI" or message_text == "🤖 DEVO+ai":
+        # «🤖 DEVO+ai» — старое имя кнопки до переименования в DEVORKS+:
+        # принимаем его, чтобы у пользователей со старой клавиатурой
+        # кнопка продолжила работать без /start.
         context.user_data['ai_mode'] = True
         await update.message.reply_text(
             "🤖 **Режим ai активирован!**\n\n"
-            "Теперь все ваши сообщения будут отправляться DEVO+ai.\n"
+            "Теперь все ваши сообщения будут отправляться DEVORKS+AI.\n"
             "Я всегда отвечаю на русском языке!\n\n"
             "Напишите ваш вопрос или нажмите '❌ Выход из ai' для выхода.",
             reply_markup=ReplyKeyboardMarkup([["❌ Выход из ai"]], resize_keyboard=True),
@@ -5661,8 +5929,13 @@ async def create_personal_button_url_handler(update: Update, context: ContextTyp
         await update.message.reply_text(error_text)
         return CREATE_PERSONAL_BUTTON_URL
 
-    if not (url.startswith('http://') or url.startswith('https://')):
-        url = 'https://' + url
+    # ТЗ DEVORKS+ п.3: мягкая валидация ссылки — корректные URL больше
+    # не отклоняются (раньше любой URL с «/» браковался проверкой
+    # запрещённых символов). Протокол можно не указывать.
+    ok, url, err_msg = _normalize_user_url(url)
+    if not ok:
+        await update.message.reply_text(err_msg)
+        return CREATE_PERSONAL_BUTTON_URL
 
     button_name = context.user_data.get('personal_button_name')
 
@@ -5865,9 +6138,21 @@ async def edit_personal_button_content_start(update: Update, context: ContextTyp
     context.user_data['editing_personal_button_field'] = 'content'
     context.user_data['editing_personal_button_id'] = button_id
 
-    text = "📝 Введите новое содержимое кнопки:"
+    # ТЗ DEVORKS+ п.3: для кнопки-ссылки просим именно ссылку (URL).
+    prompt = "📝 Введите новое содержимое кнопки:"
+    try:
+        buttons = load_personal_buttons()
+        if button_id in buttons and getattr(
+            buttons[button_id], 'button_type', 'text'
+        ) == 'url':
+            prompt = (
+                "🔗 Введите новую ссылку для кнопки\n"
+                "(можно без протокола, например: vk.com/page):"
+            )
+    except Exception as e:
+        logger.error(f"edit_personal_button_content_start: {e}")
 
-    await query.edit_message_text(text, reply_markup=get_cancel_keyboard())
+    await query.edit_message_text(prompt, reply_markup=get_cancel_keyboard())
     return EDIT_PERSONAL_BUTTON_CONTENT
 
 @timeout(CONVERSATION_TIMEOUT)
@@ -6001,12 +6286,24 @@ async def save_personal_button_edit(update: Update, context: ContextTypes.DEFAUL
             await update.message.reply_text(error_text)
             return EDIT_PERSONAL_BUTTON_CONTENT
 
-        rejected = await reject_if_forbidden_chars(update, new_value, EDIT_PERSONAL_BUTTON_CONTENT)
-        if rejected is not None:
-            return rejected
+        # ТЗ DEVORKS+ п.3: если кнопка имеет тип «ссылка», её содержимое —
+        # это URL. ИСПРАВЛЕНО: раньше сюда применялась проверка запрещённых
+        # символов, и любой корректный URL (в нём всегда есть «/») получал
+        # отказ «недопустимые символы». Теперь URL валидируется отдельно.
+        if getattr(buttons[button_id], 'button_type', 'text') == 'url':
+            ok, normalized_url, err_msg = _normalize_user_url(new_value)
+            if not ok:
+                await update.message.reply_text(err_msg)
+                return EDIT_PERSONAL_BUTTON_CONTENT
+            buttons[button_id].content = normalized_url
+            success_text = "✅ Ссылка кнопки обновлена!"
+        else:
+            rejected = await reject_if_forbidden_chars(update, new_value, EDIT_PERSONAL_BUTTON_CONTENT)
+            if rejected is not None:
+                return rejected
 
-        buttons[button_id].content = new_value
-        success_text = "✅ Содержимое кнопки обновлено!"
+            buttons[button_id].content = new_value
+            success_text = "✅ Содержимое кнопки обновлено!"
 
     save_personal_buttons(buttons)
 
@@ -6103,8 +6400,12 @@ async def save_personal_button_url(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(error_text)
         return EDIT_PERSONAL_BUTTON_URL
 
-    if not (url.startswith('http://') or url.startswith('https://')):
-        url = 'https://' + url
+    # ТЗ DEVORKS+ п.3: нормализация без ложных отказов (протокол можно
+    # не указывать; ссылки с «/» принимаются корректно).
+    ok, url, err_msg = _normalize_user_url(url)
+    if not ok:
+        await update.message.reply_text(err_msg)
+        return EDIT_PERSONAL_BUTTON_URL
 
     buttons = load_personal_buttons()
     if button_id not in buttons:
@@ -8492,6 +8793,9 @@ async def change_layout_handler(update: Update, context: ContextTypes.DEFAULT_TY
     layout = query.data.replace("layout_", "")
 
     user.button_layout = layout
+    # ТЗ п.1: выбранная ранее сетка (2/3/4) отменяется — пользователь явно
+    # перешёл на «старую» схему расположения, она имеет приоритет.
+    user.keyboard_rows = None
     save_user(user)
 
     layout_names = {'default': 'Стандартная', 'compact': 'Компактная', 'wide': 'Широкая'}
@@ -8503,6 +8807,117 @@ async def change_layout_handler(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=get_main_menu_keyboard(user)
     )
     return await user_settings(update, context)
+
+
+# ==================================
+# === ТЗ п.1: СЕТКА КНОПОК (2 / 3 / 4 ряда) ===
+# ==================================
+
+def _get_keyboard_grid_keyboard(user):
+    """Клавиатура выбора сетки: 2 / 3 / 4 кнопки в ряду + сброс."""
+    current = getattr(user, 'keyboard_rows', None)
+    current = current if current in (2, 3, 4) else 2
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{2 == current and '✅ ' or ''}2 ряда (по умолчанию)",
+            callback_data="kb_rows_2"
+        )],
+        [InlineKeyboardButton(
+            f"{3 == current and '✅ ' or ''}3 ряда",
+            callback_data="kb_rows_3"
+        )],
+        [InlineKeyboardButton(
+            f"{4 == current and '✅ ' or ''}4 ряда",
+            callback_data="kb_rows_4"
+        )],
+        [InlineKeyboardButton("🔁 Вернуть как было (2 ряда)", callback_data="kb_rows_reset")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_settings")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def keyboard_grid_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открывает меню «📱 Сетка кнопок» (ТЗ п.1)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+
+    current = getattr(user, 'keyboard_rows', None)
+    current = current if current in (2, 3, 4) else 2
+    text = (
+        "📱 **Сетка кнопок**\n\n"
+        f"Сейчас: {current} кнопки в ряду.\n\n"
+        "Выберите, сколько кнопок показывать в ряду "
+        "главного меню. Настройка сохраняется в вашем профиле "
+        "и применяется ко всем клавиатурам бота."
+    )
+    try:
+        await query.edit_message_text(
+            text, reply_markup=_get_keyboard_grid_keyboard(user),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=user_id, text=text,
+            reply_markup=_get_keyboard_grid_keyboard(user),
+        )
+    return USER_SETTINGS
+
+
+async def set_keyboard_grid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет выбранную сетку (2/3/4) и сразу обновляет клавиатуру."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    user = get_user(user_id)
+    if not user:
+        user = User(user_id)
+
+    data = query.data
+    if data == "kb_rows_reset":
+        # «Вернуть как было» — стандартный вид: 2 ряда.
+        user.keyboard_rows = 2
+        user.button_layout = "default"
+        answer_text = "✅ Сетка сброшена на стандартный вид: 2 ряда."
+    else:
+        try:
+            rows = int(data.replace("kb_rows_", ""))
+        except ValueError:
+            await query.answer("Некорректный выбор.")
+            return USER_SETTINGS
+        if rows not in (2, 3, 4):
+            await query.answer("Доступно только 2, 3 или 4 ряда.")
+            return USER_SETTINGS
+        user.keyboard_rows = rows
+        user.button_layout = "default"
+        answer_text = f"✅ Сетка изменена: {rows} кнопки в ряду."
+    save_user(user)
+
+    # Мгновенно применяем: присылаем обновлённую клавиатуру главного меню.
+    # В беседе сообщение уходит в текущий чат (peer_id), в ЛС — пользователю.
+    try:
+        await query.edit_message_text(
+            answer_text,
+            reply_markup=_get_keyboard_grid_keyboard(user),
+        )
+    except Exception:
+        pass
+    target = _chat_reply_target(update, user)
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text="⚙️ Меню обновлено под новую сетку!",
+            reply_markup=get_main_menu_keyboard(user),
+        )
+    except Exception as e:
+        logger.error(f"set_keyboard_grid_handler: обновление клавиатуры: {e}")
+    return USER_SETTINGS
+
 
 @timeout(CONVERSATION_TIMEOUT)
 async def reorder_buttons_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10429,12 +10844,21 @@ async def edit_bell_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @timeout(CONVERSATION_TIMEOUT)
 async def save_bell_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1 из 2: сохраняет время НАЧАЛА урока и один раз спрашивает
+    время окончания (ТЗ DEVORKS+ п.3 — устранение зацикливания).
+
+    ИСПРАВЛЕНО: раньше после ввода начала бот возвращал ТО ЖЕ состояние
+    EDIT_BELL_TIME, а обработчик конца не был зарегистрирован вовсе —
+    ввод «времени окончания» снова воспринимался как «время начала»,
+    и бот бесконечно спрашивал начало/конец. Теперь начало →
+    EDIT_BELL_END → конец → сохранение и выход в админ-панель.
+    """
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
 
-    time_str = update.message.text.strip()
+    time_str = (update.message.text or "").strip()
     lesson_num = context.user_data.get('editing_bell_lesson')
     class_code = context.user_data.get('current_admin_class')
 
@@ -10444,33 +10868,45 @@ async def save_bell_time_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         datetime.strptime(time_str, "%H:%M")
-
-        class_obj = get_class_by_code(class_code)
-        if class_obj:
-            if lesson_num not in class_obj.bells:
-                class_obj.bells[lesson_num] = {}
-
-            class_obj.bells[lesson_num]['start'] = time_str
-            context.user_data['editing_bell_start'] = time_str
-
-            await update.message.reply_text(f"✅ Время начала: {time_str}\n\nВведите время окончания в формате ЧЧ:ММ:")
-            return EDIT_BELL_TIME
-        else:
-            await update.message.reply_text("Не удалось сохранить. Попробуйте снова.")
-            return await admin_panel(update, context)
-
     except ValueError:
-        await update.message.reply_text("Введите время в формате ЧЧ:ММ:")
+        await update.message.reply_text(
+            "Введите время в формате ЧЧ:ММ (например, 08:00):"
+        )
         return EDIT_BELL_TIME
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await update.message.reply_text("Не удалось сохранить. Попробуйте снова.")
+        return await admin_panel(update, context)
+
+    if lesson_num not in class_obj.bells:
+        class_obj.bells[lesson_num] = {}
+
+    class_obj.bells[lesson_num]['start'] = time_str
+    context.user_data['editing_bell_start'] = time_str
+
+    await update.message.reply_text(
+        f"✅ Время начала: {time_str}\n\n"
+        "Теперь введите время окончания в формате ЧЧ:ММ:"
+    )
+    # ПЕРЕХОД на состояние ввода КОНЦА (новое состояние EDIT_BELL_END).
+    return EDIT_BELL_END
 
 @timeout(CONVERSATION_TIMEOUT)
 async def save_bell_end_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2 из 2: сохраняет время ОКОНЧЕНИЯ урока и завершает настройку
+    (ТЗ DEVORKS+ п.3 — устранение зацикливания).
+
+    Спрашивает параметры строго по одному разу: начало спрашивается один
+    раз в EDIT_BELL_TIME, конец — один раз в EDIT_BELL_END. Валидация:
+    формат ЧЧ:ММ и окончание не раньше начала.
+    """
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
     if not user:
         user = User(user_id)
 
-    time_str = update.message.text.strip()
+    time_str = (update.message.text or "").strip()
     lesson_num = context.user_data.get('editing_bell_lesson')
     class_code = context.user_data.get('current_admin_class')
     start_time = context.user_data.get('editing_bell_start')
@@ -10481,24 +10917,47 @@ async def save_bell_end_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         datetime.strptime(time_str, "%H:%M")
-
-        class_obj = get_class_by_code(class_code)
-        if class_obj:
-            class_obj.bells[lesson_num]['start'] = start_time
-            class_obj.bells[lesson_num]['end'] = time_str
-
-            classes = load_classes()
-            classes[class_code] = class_obj
-            save_classes(classes)
-
-            await update.message.reply_text(f"✅ Время {lesson_num} урока обновлено: {start_time} - {time_str}")
-        else:
-            await update.message.reply_text("Не удалось сохранить. Попробуйте снова.")
-
     except ValueError:
-        await update.message.reply_text("Введите время в формате ЧЧ:ММ:")
-        return EDIT_BELL_TIME
+        await update.message.reply_text(
+            "Введите время в формате ЧЧ:ММ (например, 08:45):"
+        )
+        return EDIT_BELL_END
 
+    # Валидация: конец урока не может быть раньше начала.
+    try:
+        start_dt = datetime.strptime(start_time, "%H:%M")
+        end_dt = datetime.strptime(time_str, "%H:%M")
+        if end_dt <= start_dt:
+            await update.message.reply_text(
+                "❌ Время окончания не может быть раньше или равно времени начала "
+                f"({start_time}). Введите время окончания ещё раз в формате ЧЧ:ММ:"
+            )
+            return EDIT_BELL_END
+    except ValueError:
+        pass
+
+    class_obj = get_class_by_code(class_code)
+    if not class_obj:
+        await update.message.reply_text("Не удалось сохранить. Попробуйте снова.")
+        context.user_data.pop('editing_bell_lesson', None)
+        context.user_data.pop('editing_bell_start', None)
+        return await admin_panel(update, context)
+
+    if lesson_num not in class_obj.bells:
+        class_obj.bells[lesson_num] = {}
+
+    class_obj.bells[lesson_num]['start'] = start_time
+    class_obj.bells[lesson_num]['end'] = time_str
+
+    classes = load_classes()
+    classes[class_code] = class_obj
+    save_classes(classes)
+
+    await update.message.reply_text(
+        f"✅ Время {lesson_num} урока обновлено: {start_time} - {time_str}"
+    )
+
+    # Чистим временные данные — цикл завершён ровно за два шага.
     context.user_data.pop('editing_bell_lesson', None)
     context.user_data.pop('editing_bell_start', None)
     return await admin_panel(update, context)
@@ -12074,6 +12533,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await change_language_handler(update, context)
     elif data.startswith("layout_"):
         return await change_layout_handler(update, context)
+    # ТЗ п.1: сетка кнопок (2/3/4 ряда).
+    elif data == "kb_grid":
+        return await keyboard_grid_start(update, context)
+    elif data.startswith("kb_rows_"):
+        return await set_keyboard_grid_handler(update, context)
     elif data.startswith("select_btn_"):
         return await select_button_to_rename(update, context)
     elif data.startswith("reorder_btn_"):
@@ -12330,6 +12794,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await dev_paid_button_delete_handler(update, context)
     elif data.startswith("dev_pb_price_"):
         return await dev_paid_button_price_change_start(update, context)
+    elif data.startswith("dev_pb_rename_"):
+        return await dev_paid_button_rename_start(update, context)
+    elif data.startswith("dev_pb_content_"):
+        return await dev_paid_button_content_start(update, context)
     elif data.startswith("dev_pb_edit_"):
         return await dev_paid_button_edit_menu(update, context)
     elif data == "dev_payments":
@@ -13368,11 +13836,11 @@ async def weather_settings_start(update: Update, context: ContextTypes.DEFAULT_T
     city = getattr(user, 'city', None) or "не выбран"
     text = (
         f"🌦 **Настройки погоды**\n\n"
-        f"⚠️ Ежедневная автоматическая погода ОТКЛЮЧЕНА.\n"
-        f"Чтобы получить прогноз, нажмите кнопку «🌦 Погода» в главном меню.\n\n"
-        f"Тоггл уведомлений (для совместимости): {'Включены' if enabled else 'Выключены'}\n"
-        f"⏰ Время (только справочно): {weather_time}\n"
+        f"🔔 Ежедневная авто-погода: {'Включена' if enabled else 'Выключена'}\n"
+        f"⏰ Время уведомления (по вашему часовому поясу): {weather_time}\n"
         f"🏙 Город: {city}\n\n"
+        f"Уведомление приходит один раз в день в указанное время.\n"
+        f"Прогноз на 3 дня доступен по кнопке «🌦 Погода» в меню.\n\n"
         f"Выберите действие:"
     )
     try:
@@ -14183,6 +14651,12 @@ async def _unified_notification_tick_locked(context):
     основная логика выполнялась внутри `_unified_tick_lock` ровно один
     раз за тик и не пересекалась с другим тиком."""
     bot = context.bot
+    # ТЗ DEVORKS+ п.2: моментальная синхронизация цен — раз в тик (30 сек)
+    # проверяем, не изменился ли prices.json извне, и перечитываем его.
+    try:
+        _maybe_refresh_prices()
+    except Exception as e:
+        logger.error(f"unified_tick: refresh prices: {e}")
     # Диагностика: видно в логах каждые 30 сек, что тикер вообще
     # работает. Если этих строк нет — значит, бот спит/не запустился, и
     # никакие проверки времени не помогут.
@@ -14314,15 +14788,63 @@ async def _unified_notification_tick_locked(context):
                         _mark_notification_sent(log, uid, 'evening', eve_occ)
                         log_changed = True
 
-            # 2c) Погода
-            # ПУНКТ 7: погода БОЛЬШЕ НЕ приходит ежедневно автоматически.
-            # Пользователь сам нажимает кнопку «🌦 Погода» в главном меню.
-            # Этот блок намеренно отключён, чтобы соответствовать новому
-            # поведению. Чтобы избежать «догона» уведомлений после рестарта
-            # сервиса, сразу помечаем сегодняшний weather-слот отправленным.
-            if not _notification_already_sent(log, uid, 'weather', local_today_str):
-                _mark_notification_sent(log, uid, 'weather', local_today_str)
-                log_changed = True
+            # 2c) Погода — ИСПРАВЛЕНО (ТЗ DEVORKS+ п.3 «Уведомления о погоде»).
+            # Раньше этот блок был принудительно отключён («погода больше не
+            # приходит автоматически»), из-за чего рассылок в JobQueue не
+            # было вовсе и уведомления не приходили в установленное время.
+            # Теперь погода отправляется автоматически:
+            #   • только если пользователь включил погодные уведомления
+            #     (user.weather_notifications, по умолчанию ВКЛ);
+            #   • строго в его локальное время (user.weather_notification_time
+            #     с учётом его часового пояса user.timezone — локальное время
+            #     считается через _user_local_now с коррекцией дрейфа часов);
+            #   • один раз в день (журнал NOTIFICATION_LOG_FILE, ключ 'weather'
+            #     привязан к дате слота — дубли исключены);
+            #   • только если указан город (иначе слот помечается «пропущен»).
+            if getattr(user, 'weather_notifications', True):
+                weather_t = (
+                    getattr(user, 'weather_notification_time', '07:00')
+                    or '07:00'
+                )
+                due, too_late, weather_occ = _is_daily_time_due(
+                    local_now, weather_t, max_late_minutes=6 * 60
+                )
+                if weather_occ and not _notification_already_sent(
+                    log, uid, 'weather', weather_occ
+                ):
+                    if due:
+                        try:
+                            if getattr(user, 'city', None):
+                                weather_text = await weather_current_text(user.city)
+                                await bot.send_message(
+                                    chat_id=int(uid),
+                                    text=(
+                                        f"🌅 Доброе утро! Погода на сегодня:\n\n"
+                                        f"{weather_text}"
+                                    ),
+                                    reply_markup=InlineKeyboardMarkup([
+                                        [InlineKeyboardButton(
+                                            "📅 Узнать на 3 дня",
+                                            callback_data="weather_3days",
+                                        )]
+                                    ]),
+                                )
+                                logger.info(
+                                    f"unified_tick: погода -> {uid} "
+                                    f"отправлено (слот {weather_occ})."
+                                )
+                            # Город не задан — считаем слот «обработанным»,
+                            # чтобы не копить его до появления города.
+                            _mark_notification_sent(
+                                log, uid, 'weather', weather_occ
+                            )
+                            _save_notification_log(log)
+                            log_changed = False
+                        except Exception as e:
+                            logger.error(f"unified_tick: weather {uid}: {e}")
+                    elif too_late:
+                        _mark_notification_sent(log, uid, 'weather', weather_occ)
+                        log_changed = True
 
             # 2d) Праздники.
             # Праздник — событие на весь день, поэтому окно опоздания
@@ -15438,6 +15960,8 @@ async def dev_paid_button_edit_menu(update: Update, context: ContextTypes.DEFAUL
     try:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 Изменить цену", callback_data=f"dev_pb_price_{button_id}")],
+            [InlineKeyboardButton("✏️ Переименовать", callback_data=f"dev_pb_rename_{button_id}")],
+            [InlineKeyboardButton("📝 Изменить контент", callback_data=f"dev_pb_content_{button_id}")],
             [InlineKeyboardButton("🗑️ Удалить кнопку", callback_data=f"dev_pb_delete_{button_id}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="dev_paid_buttons")],
         ]))
@@ -15446,11 +15970,146 @@ async def dev_paid_button_edit_menu(update: Update, context: ContextTypes.DEFAUL
             chat_id=query.from_user.id, text=text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💰 Изменить цену", callback_data=f"dev_pb_price_{button_id}")],
+                [InlineKeyboardButton("✏️ Переименовать", callback_data=f"dev_pb_rename_{button_id}")],
+                [InlineKeyboardButton("📝 Изменить контент", callback_data=f"dev_pb_content_{button_id}")],
                 [InlineKeyboardButton("🗑️ Удалить кнопку", callback_data=f"dev_pb_delete_{button_id}")],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="dev_paid_buttons")],
             ]),
         )
     return DEV_PAID_BUTTON_MENU
+
+
+async def dev_paid_button_rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ТЗ п.2: запрашивает новое название платной кнопки."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        return DEV_PANEL
+
+    button_id = query.data.replace("dev_pb_rename_", "")
+    button = _get_global_button_by_id(button_id)
+    if not button:
+        await query.edit_message_text("Кнопка не найдена.")
+        return DEV_PAID_BUTTON_MENU
+
+    context.user_data['dev_pb_edit_id'] = str(button_id)
+    try:
+        await query.edit_message_text(
+            f"✏️ Текущее название: «{button.name}»\n\n"
+            "Введите новое название кнопки:",
+            reply_markup=get_cancel_keyboard(),
+        )
+    except Exception:
+        pass
+    return DEV_PAID_BUTTON_RENAME
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def dev_paid_button_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ТЗ п.2: сохраняет новое название платной кнопки (мгновенная синхронизация)."""
+    if str(update.effective_user.id) != str(DEVELOPER_ID):
+        await update.message.reply_text("Доступ запрещён.")
+        return DEV_PANEL
+
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым. Введите новое название:")
+        return DEV_PAID_BUTTON_RENAME
+
+    button_id = context.user_data.get('dev_pb_edit_id')
+    buttons_data = load_data(GLOBAL_BUTTONS_FILE, {})
+    if not button_id or button_id not in buttons_data:
+        await update.message.reply_text("Кнопка не найдена.")
+        return await _dev_paid_buttons_reopen(update, context)
+
+    buttons_data[button_id]['name'] = name
+    save_data(GLOBAL_BUTTONS_FILE, buttons_data)
+
+    # Мгновенная синхронизация: инвалидируем кэш глобальных кнопок.
+    global _cache_last_update
+    _cache_last_update.pop('global_buttons', None)
+    _global_buttons_cache.clear()
+
+    await update.message.reply_text(
+        f"✅ Название изменено на «{name}».\n\n"
+        "Новое название пользователи увидят при следующем открытии меню."
+    )
+    return await _dev_paid_buttons_reopen(update, context)
+
+
+async def dev_paid_button_content_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ТЗ п.2: запрашивает новый контент платной кнопки (текст или URL —
+    по типу кнопки). Это редактирование СУЩЕСТВУЮЩЕЙ кнопки — не путать с
+    dev_paid_button_content_handler (создание новой)."""
+    query = update.callback_query
+    await query.answer()
+    if str(query.from_user.id) != str(DEVELOPER_ID):
+        return DEV_PANEL
+
+    button_id = query.data.replace("dev_pb_content_", "")
+    button = _get_global_button_by_id(button_id)
+    if not button:
+        await query.edit_message_text("Кнопка не найдена.")
+        return DEV_PAID_BUTTON_MENU
+
+    context.user_data['dev_pb_edit_id'] = str(button_id)
+    if button.button_type == "url":
+        prompt = (
+            f"🔗 Текущая ссылка: {button.content}\n\n"
+            "Введите новую ссылку (URL):"
+        )
+    else:
+        prompt = (
+            f"📄 Текущий текст: {str(button.content)[:200]}\n\n"
+            "Введите новый текст кнопки:"
+        )
+    try:
+        await query.edit_message_text(prompt, reply_markup=get_cancel_keyboard())
+    except Exception:
+        pass
+    return DEV_PAID_BUTTON_EDIT_CONTENT
+
+
+@timeout(CONVERSATION_TIMEOUT)
+async def dev_paid_button_edit_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ТЗ п.2: сохраняет новый контент платной кнопки (мгновенная синхронизация).
+    Редактирование существующей кнопки."""
+    if str(update.effective_user.id) != str(DEVELOPER_ID):
+        await update.message.reply_text("Доступ запрещён.")
+        return DEV_PANEL
+
+    content = (update.message.text or "").strip()
+    button_id = context.user_data.get('dev_pb_edit_id')
+    buttons_data = load_data(GLOBAL_BUTTONS_FILE, {})
+    if not button_id or button_id not in buttons_data:
+        await update.message.reply_text("Кнопка не найдена.")
+        return await _dev_paid_buttons_reopen(update, context)
+
+    button_type = buttons_data[button_id].get('button_type', 'text')
+    if not content:
+        await update.message.reply_text("Содержимое не может быть пустым. Введите новое:")
+        return DEV_PAID_BUTTON_EDIT_CONTENT
+
+    # Для кнопки-ссылки нормализуем ввод (протокол можно не указывать).
+    if button_type == "url":
+        ok, content, err_msg = _normalize_user_url(content)
+        if not ok:
+            await update.message.reply_text(err_msg)
+            return DEV_PAID_BUTTON_EDIT_CONTENT
+
+    buttons_data[button_id]['content'] = content
+    save_data(GLOBAL_BUTTONS_FILE, buttons_data)
+
+    # Мгновенная синхронизация: инвалидируем кэш глобальных кнопок.
+    global _cache_last_update
+    _cache_last_update.pop('global_buttons', None)
+    _global_buttons_cache.clear()
+
+    await update.message.reply_text(
+        "✅ Контент кнопки обновлён!\n\n"
+        "Новый контент мгновенно доступен всем купившим пользователям."
+    )
+    return await _dev_paid_buttons_reopen(update, context)
 
 
 async def dev_paid_button_price_change_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15994,6 +16653,13 @@ def register_handlers(application):
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_bell_time_handler),
                 CallbackQueryHandler(handle_callback),
             ],
+            # ТЗ DEVORKS+: второй шаг ввода звонка — время ОКОНЧАНИЯ.
+            # Раньше оба шага висели на EDIT_BELL_TIME, обработчик конца не
+            # был зарегистрирован — бот бесконечно спрашивал «время начала».
+            EDIT_BELL_END: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_bell_end_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
             SET_HOLIDAYS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_holidays_handler),
                 CallbackQueryHandler(handle_callback),
@@ -16338,6 +17004,16 @@ def register_handlers(application):
                 MessageHandler(filters.TEXT & ~filters.COMMAND, dev_paid_button_price_change_handler),
                 CallbackQueryHandler(handle_callback),
             ],
+            # ТЗ DEVORKS+ п.2: редактирование названия платной кнопки.
+            DEV_PAID_BUTTON_RENAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_paid_button_rename_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
+            # ТЗ DEVORKS+ п.2: редактирование контента платной кнопки.
+            DEV_PAID_BUTTON_EDIT_CONTENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dev_paid_button_edit_content_handler),
+                CallbackQueryHandler(handle_callback),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -16441,13 +17117,40 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}\n{error_text}")
 
     if update:
+        # ТЗ п.0 «Проверка прав»: если боту не хватает прав в беседе
+        # (чтение сообщений / отправка ответов), VK отвечает ошибкой
+        # 900/901/902/1021 → Forbidden. Сообщаем разработчику, а в сам
+        # чат (по возможности) — подсказку добавить бота админом.
+        err = getattr(context, 'error', None)
+        if isinstance(err, TGForbidden):
+            logger.warning(
+                "TGForbidden: боту не хватает прав для отправки сообщений "
+                "(пользователь запретил сообщения от сообщества либо бот "
+                "не может писать в беседу)."
+            )
+            if _is_group_update(update) and DEVELOPER_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(DEVELOPER_ID),
+                        text=(
+                            "⚠️ Боту DEVORKS+ не хватает прав в беседе "
+                            f"(peer_id={getattr(update.effective_chat, 'id', '?')}): "
+                            "проверьте, что бот добавлен в беседу и ему разрешена "
+                            "отправка сообщений (Управление сообщества → "
+                            "Сообщения → «Разрешить сообщения бесед»)."
+                        ),
+                    )
+                except Exception:
+                    pass
+            return
         try:
             user_id = update.effective_user.id if update.effective_user else None
             if user_id:
                 user = get_user(str(user_id))
                 keyboard = get_main_menu_keyboard(user) if user else None
+                # ТЗ п.0: в беседе ответ уходит в чат, в ЛС — пользователю.
                 await context.bot.send_message(
-                    chat_id=user_id,
+                    chat_id=_chat_reply_target(update, user),
                     text="Попробуйте ещё раз или нажмите /start",
                     reply_markup=keyboard
                 )
